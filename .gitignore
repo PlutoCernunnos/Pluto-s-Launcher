@@ -1,0 +1,20 @@
+# Your personal library: local paths, play counts, and possibly a GitHub token.
+# Never commit this.
+launcher_config.json
+
+# Generated when you click "Pin to desktop"
+launcher.ico
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Editors and OS clutter
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
