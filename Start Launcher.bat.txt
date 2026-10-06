@@ -1,0 +1,14 @@
+@echo off
+rem Double-click to open the launcher. No VS Code or terminal needed.
+cd /d "%~dp0"
+py -c "import tkinter" >nul 2>nul && (start "" pyw launcher.py & exit /b)
+python -c "import tkinter" >nul 2>nul && (start "" pythonw launcher.py & exit /b)
+echo Couldn't find Python 3 with tkinter.
+echo Get it from python.org (tick "Add python.exe to PATH"), then double-click this again.
+where winget >nul 2>nul || (pause & exit /b)
+choice /m "Or install it now with winget"
+if errorlevel 2 exit /b
+winget install -e --id Python.Python.3.12
+echo.
+echo Done. Double-click Start Launcher.bat again.
+pause
