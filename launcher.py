@@ -9,13 +9,16 @@ launcher.py - a Steam-style library for your own projects.
                      command (run*.bat, .exe, main.py, .ps1, npm start,
                      cargo run, ...) plus extra commands like tests and builds.
 "Add project"     -> any folder + any command, Python or not.
+"Menu"            -> new project from a template, stats, export/import your
+                     library, themes, check for updates.
 
 Per project: Play/Stop, extra commands, one-click setup (venv / npm install),
-playtime, run logs, git status, cover art, favorites, notes.
+playtime, run logs, screenshots, git status, cover art, favorites, notes.
 List or grid view. Ctrl+K quick launch, F5 refresh git status.
 
 Stdlib only (tkinter). Your library is saved next to this file in
-launcher_config.json, so keep the two together.
+launcher_config.json, so keep the two together. logs/, backups/ and
+screenshots/ are created next to it too, each with its own .gitignore.
 """
 
 import base64
@@ -31,10 +34,11 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import webbrowser
 import zlib
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import tkinter as tk
@@ -43,18 +47,56 @@ from tkinter import ttk, filedialog, messagebox
 APP_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = APP_DIR / "launcher_config.json"
 LOG_DIR = APP_DIR / "logs"
+BACKUP_DIR = APP_DIR / "backups"
+SHOT_DIR = APP_DIR / "screenshots"
 IS_WIN = sys.platform.startswith("win")
 NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if IS_WIN else {}
 
-# ---- theme (Steam-ish blues) ---------------------------------------------
+# where "Check for updates" looks when this copy isn't a git clone
+UPDATE_REPO = "PlutoCernunnos/Pluto-s-Launcher"
+UPDATE_BRANCH = "main"
+UPDATE_FILES = ("launcher.py", "Start Launcher.bat")
+
+# ---- themes ----------------------------------------------------------------
+THEMES = {
+    "Steam": dict(BG="#171d25", PANEL="#1f2a37", PANEL2="#2f4a68", FG="#c7d5e0", DIM="#8f98a0",
+                  ACCENT="#66c0f4", ACCENT_HOT="#8fd3ff", PLAY="#4c8b2f", PLAY_HOT="#6ab04c",
+                  TITLE="#ffffff", ON_ACCENT="#000000"),
+    "Midnight": dict(BG="#14121f", PANEL="#1d1a2e", PANEL2="#3a3160", FG="#d8d4f0", DIM="#8c87a8",
+                     ACCENT="#a68cff", ACCENT_HOT="#c3b2ff", PLAY="#5a4bd1", PLAY_HOT="#7565e6",
+                     TITLE="#ffffff", ON_ACCENT="#000000"),
+    "Forest": dict(BG="#121a14", PANEL="#1a261d", PANEL2="#2e4a35", FG="#cfe3d3", DIM="#86a08c",
+                   ACCENT="#7fd18b", ACCENT_HOT="#a3e4ac", PLAY="#3d8b4a", PLAY_HOT="#52a85f",
+                   TITLE="#ffffff", ON_ACCENT="#000000"),
+    "Ember": dict(BG="#1c1512", PANEL="#281d18", PANEL2="#5a3726", FG="#f0ddd2", DIM="#a8907f",
+                  ACCENT="#ff9a5c", ACCENT_HOT="#ffb88a", PLAY="#c4622d", PLAY_HOT="#de7a42",
+                  TITLE="#ffffff", ON_ACCENT="#000000"),
+    "Light": dict(BG="#eef1f5", PANEL="#ffffff", PANEL2="#d5dde8", FG="#1f2933", DIM="#6b7785",
+                  ACCENT="#1a73c9", ACCENT_HOT="#3d8fe0", PLAY="#2f8a3a", PLAY_HOT="#3fa34b",
+                  TITLE="#0d1620", ON_ACCENT="#ffffff"),
+    "High contrast": dict(BG="#000000", PANEL="#0a0a0a", PANEL2="#333333", FG="#ffffff", DIM="#c8c8c8",
+                          ACCENT="#ffd400", ACCENT_HOT="#ffe866", PLAY="#008a00", PLAY_HOT="#00b300",
+                          TITLE="#ffffff", ON_ACCENT="#000000"),
+}
+# the active palette lives in these globals; apply_palette() swaps them
 BG, PANEL, PANEL2 = "#171d25", "#1f2a37", "#2f4a68"
-FG, DIM, ACCENT = "#c7d5e0", "#8f98a0", "#66c0f4"
+FG, DIM, ACCENT, ACCENT_HOT = "#c7d5e0", "#8f98a0", "#66c0f4", "#8fd3ff"
 PLAY, PLAY_HOT = "#4c8b2f", "#6ab04c"
+TITLE, ON_ACCENT = "#ffffff", "#000000"
 STOP, STOP_HOT = "#a33a3a", "#c44c4c"
 FONT = ("Segoe UI", 10)
 MONO = ("Consolas", 9)
 TILE_W, TILE_H, ART = 140, 172, 96  # grid view tile size and cover size
 TILE_COLORS = ["#3a6ea5", "#7a4fa3", "#a5523a", "#3a8f6e", "#a58a3a", "#3a8fa5", "#a53a6b", "#5a6b7a"]
+
+
+def apply_palette(name: str) -> str:
+    """Switch the colour globals to theme `name` (falls back to Steam). Returns the name used."""
+    if name not in THEMES:
+        name = "Steam"
+    globals().update(THEMES[name])
+    return name
+
 
 SKIP_DIRS = {"__pycache__", "node_modules", ".git", ".venv", "venv", "env",
              ".idea", ".vscode", "dist", "build"}
@@ -88,10 +130,146 @@ SHELL_SPECIAL = set(" &()[]{}^=;!'+,`~%$")
 COVER_NAMES = ("cover", "icon", "logo", "banner", "screenshot", "preview")
 COVER_DIRS = ("", "assets", "images", "img", "media", "docs", "res", "resources", ".github")
 
+# Windows screenshot of whichever window is in front after a short delay. Plain
+# PowerShell + .NET, nothing to install.
+SCREENSHOT_PS = r'''
+Add-Type -AssemblyName System.Drawing
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class LauncherShot {
+    [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out Rect r);
+    public struct Rect { public int Left, Top, Right, Bottom; }
+}
+"@
+[LauncherShot]::SetProcessDPIAware() | Out-Null
+Start-Sleep -Seconds __DELAY__
+$r = New-Object LauncherShot+Rect
+[LauncherShot]::GetWindowRect([LauncherShot]::GetForegroundWindow(), [ref]$r) | Out-Null
+$w = $r.Right - $r.Left
+$h = $r.Bottom - $r.Top
+if ($w -le 0 -or $h -le 0) { exit 2 }
+$bmp = New-Object System.Drawing.Bitmap $w, $h
+$g = [System.Drawing.Graphics]::FromImage($bmp)
+$g.CopyFromScreen($r.Left, $r.Top, 0, 0, $bmp.Size)
+$bmp.Save(__PATH__, [System.Drawing.Imaging.ImageFormat]::Png)
+$g.Dispose()
+$bmp.Dispose()
+'''
+
+# ---- project templates -----------------------------------------------------
+PY_IGNORE = "__pycache__/\n*.pyc\n.venv/\n"
+README_TPL = "# __NAME__\n\nMade with Launcher.\n"
+
+GAME_PY = '''"""__NAME__: a tiny starter game. Arrow keys to move, grab the dots."""
+import random
+import tkinter as tk
+
+W, H, SIZE, SPEED = 640, 480, 24, 6
+
+root = tk.Tk()
+root.title("__NAME__")
+root.resizable(False, False)
+canvas = tk.Canvas(root, width=W, height=H, bg="#171d25", highlightthickness=0)
+canvas.pack()
+player = canvas.create_rectangle(0, 0, SIZE, SIZE, fill="#66c0f4", outline="")
+canvas.move(player, W // 2, H // 2)
+dot = canvas.create_oval(0, 0, 12, 12, fill="#6ab04c", outline="")
+score_text = canvas.create_text(10, 10, anchor="nw", fill="#c7d5e0",
+                                font=("Segoe UI", 14), text="Score: 0")
+keys = set()
+score = 0
+
+
+def place_dot():
+    x, y = random.randint(20, W - 32), random.randint(40, H - 32)
+    canvas.coords(dot, x, y, x + 12, y + 12)
+
+
+def tick():
+    global score
+    dx = (("Right" in keys) - ("Left" in keys)) * SPEED
+    dy = (("Down" in keys) - ("Up" in keys)) * SPEED
+    canvas.move(player, dx, dy)
+    x1, y1, x2, y2 = canvas.coords(player)
+    canvas.move(player, -min(x1, 0) - max(x2 - W, 0), -min(y1, 0) - max(y2 - H, 0))
+    if dot in canvas.find_overlapping(*canvas.coords(player)):
+        score += 1
+        canvas.itemconfig(score_text, text=f"Score: {score}")
+        place_dot()
+    root.after(16, tick)
+
+
+root.bind("<KeyPress>", lambda e: keys.add(e.keysym))
+root.bind("<KeyRelease>", lambda e: keys.discard(e.keysym))
+place_dot()
+tick()
+root.mainloop()
+'''
+
+SCRIPT_PY = '''"""__NAME__"""
+
+
+def main():
+    print("Hello from __NAME__!")
+
+
+if __name__ == "__main__":
+    main()
+    input("\\nPress Enter to close...")
+'''
+
+TEMPLATES = {
+    "Python game (tkinter)": {
+        "about": "A window with a little arrow-keys game loop to build on. Nothing to install.",
+        "console": False,
+        "files": {"main.py": GAME_PY, "README.md": README_TPL, ".gitignore": PY_IGNORE},
+    },
+    "Python script": {
+        "about": "A console program: main.py that prints and waits for Enter.",
+        "console": True,
+        "files": {"main.py": SCRIPT_PY, "README.md": README_TPL, ".gitignore": PY_IGNORE},
+    },
+    "Python app (with venv)": {
+        "about": "main.py plus requirements.txt. Add packages to requirements.txt, then click "
+                 "Set up and it makes a .venv and installs them.",
+        "console": True,
+        "files": {"main.py": SCRIPT_PY, "requirements.txt": "# one package per line, e.g.\n# requests\n",
+                  "README.md": README_TPL, ".gitignore": PY_IGNORE},
+    },
+    "Node app": {
+        "about": "package.json with an npm start script and index.js. Needs Node.js installed. "
+                 "Click Set up once to run npm install.",
+        "console": True,
+        "files": {"package.json": '{\n  "name": "__SLUG__",\n  "version": "0.1.0",\n  "private": true,\n'
+                                  '  "scripts": {\n    "start": "node index.js"\n  }\n}\n',
+                  "index.js": 'console.log("Hello from __NAME__!");\n',
+                  "README.md": README_TPL, ".gitignore": "node_modules/\n"},
+    },
+    "Batch script": {
+        "about": "A run.bat to fill in. Windows only.",
+        "console": True,
+        "windows_only": True,
+        "files": {"run.bat": "@echo off\necho Hello from __NAME__!\npause\n", "README.md": README_TPL},
+    },
+    "Empty folder": {
+        "about": "Just a folder with a README. Set the command later with Edit.",
+        "console": True,
+        "files": {"README.md": README_TPL},
+    },
+}
+
 
 # ---- helpers ---------------------------------------------------------------
 def _q(name: str) -> str:
     return f'"{name}"' if any(c in SHELL_SPECIAL for c in name) else name
+
+
+def ps_quote(s) -> str:
+    """PowerShell single-quoted literal."""
+    return "'" + str(s).replace("'", "''") + "'"
 
 
 def norm_key(path) -> str:
@@ -111,6 +289,21 @@ def has_user_data(p: dict) -> bool:
 def git_env() -> dict:
     # fail fast instead of waiting on a password prompt nobody can see
     return dict(os.environ, GIT_TERMINAL_PROMPT="0")
+
+
+def private_dir(path: Path) -> Path:
+    """Create a folder that git ignores by itself (it holds its own .gitignore)."""
+    path.mkdir(parents=True, exist_ok=True)
+    gi = path / ".gitignore"
+    if not gi.exists():
+        gi.write_text("*\n", encoding="utf-8")
+    return path
+
+
+def safe_name(p: dict) -> str:
+    """File-system-safe, unique-per-folder name for a project's logs and screenshots."""
+    s = re.sub(r"[^\w.-]+", "_", p["name"]).strip("_") or "project"
+    return f"{s}-{zlib.crc32(norm_key(p['path']).encode('utf-8')):08x}"
 
 
 def find_python(folder: Path) -> str:
@@ -306,6 +499,31 @@ def git_info(folder: Path):
         return None
 
 
+def newest_change(folder: Path, max_files: int = 3000) -> str:
+    """Most recent file modification in the top couple of levels, as ISO time ('' if none)."""
+    newest, seen = 0.0, 0
+    stack = [(str(folder), 0)]
+    while stack and seen < max_files:
+        d, depth = stack.pop()
+        try:
+            entries = list(os.scandir(d))
+        except OSError:
+            continue
+        for e in entries:
+            if e.name.startswith(".") or e.name in SKIP_DIRS:
+                continue
+            try:
+                if e.is_dir(follow_symlinks=False):
+                    if depth < 2:
+                        stack.append((e.path, depth + 1))
+                else:
+                    newest = max(newest, e.stat().st_mtime)
+                    seen += 1
+            except OSError:
+                pass
+    return datetime.fromtimestamp(newest).isoformat(timespec="seconds") if newest else ""
+
+
 def git_short(info) -> str:
     if not info:
         return ""
@@ -388,6 +606,33 @@ def find_cover(folder: Path):
     return None
 
 
+def shots_dir(p: dict) -> Path:
+    return SHOT_DIR / safe_name(p)
+
+
+def latest_shot(p: dict):
+    try:
+        shots = sorted(shots_dir(p).glob("*.png"))
+    except OSError:
+        return None
+    return shots[-1] if shots else None
+
+
+def screenshot_command(path: Path, delay: int):
+    """Command that saves a screenshot to `path` after `delay` seconds, or None."""
+    if IS_WIN:
+        script = SCREENSHOT_PS.replace("__DELAY__", str(delay)).replace("__PATH__", ps_quote(path))
+        return ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                "-EncodedCommand", base64.b64encode(script.encode("utf-16-le")).decode()]
+    if sys.platform == "darwin":
+        return ["screencapture", "-x", f"-T{delay}", str(path)]
+    if shutil.which("gnome-screenshot"):
+        return ["gnome-screenshot", "-w", "-d", str(delay), "-f", str(path)]
+    if shutil.which("scrot"):
+        return ["scrot", "-u", "-d", str(delay), str(path)]
+    return None
+
+
 def initials(name: str) -> str:
     words = re.findall(r"[A-Za-z0-9]+", name)
     if len(words) >= 2:
@@ -397,6 +642,10 @@ def initials(name: str) -> str:
 
 def color_for(name: str) -> str:
     return TILE_COLORS[zlib.crc32(name.encode("utf-8")) % len(TILE_COLORS)]
+
+
+def shorten(s: str, n: int) -> str:
+    return s if len(s) <= n else s[:n - 1] + "…"
 
 
 def fuzzy_score(q: str, text: str):
@@ -509,6 +758,24 @@ def save_config(cfg: dict) -> None:
     os.replace(tmp, CONFIG_FILE)
 
 
+def library_snapshot(cfg: dict) -> dict:
+    """Copy of the config that's safe to keep or share: no GitHub token."""
+    snap = json.loads(json.dumps(cfg))
+    snap.pop("github_token", None)
+    snap["backup_made"] = datetime.now().isoformat(timespec="seconds")
+    return snap
+
+
+def remap_path(path: str, old_root: str, new_root: str) -> str:
+    """Move a path from under old_root to the same place under new_root."""
+    p, o = os.path.normpath(path), os.path.normpath(old_root)
+    if norm_key(p) == norm_key(o):
+        return new_root
+    if norm_key(p).startswith(norm_key(o) + os.sep):
+        return str(Path(new_root) / p[len(o):].lstrip("\\/"))
+    return path
+
+
 def _get_json(url: str, headers: dict):
     req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=20) as r:
@@ -537,10 +804,58 @@ def fetch_github_repos(user: str, token: str = ""):
     return repos, login
 
 
+def check_for_update():
+    """('git', commits_behind, None) for a git clone of the launcher, otherwise
+    ('files', count, {name: new_bytes}) by comparing with the files on GitHub."""
+    if is_repo(APP_DIR) and shutil.which("git"):
+        f = subprocess.run(["git", "fetch", "--quiet"], cwd=str(APP_DIR), capture_output=True,
+                           text=True, timeout=60, env=git_env(), **NO_WINDOW)
+        if f.returncode:
+            raise OSError(f.stderr.strip() or "git fetch failed")
+        r = subprocess.run(["git", "rev-list", "--count", "HEAD..@{u}"], cwd=str(APP_DIR),
+                           capture_output=True, text=True, timeout=30, env=git_env(), **NO_WINDOW)
+        if r.returncode:
+            raise OSError("this copy's branch isn't tracking one on GitHub, so there's nothing to compare with")
+        return "git", int(r.stdout.strip() or 0), None
+    changed = {}
+    for name in UPDATE_FILES:
+        url = (f"https://raw.githubusercontent.com/{UPDATE_REPO}/{UPDATE_BRANCH}/"
+               f"{urllib.parse.quote(name)}")
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "launcher.py"})
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                data = resp.read()
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                continue  # not in the repo (yet)
+            raise
+        local = APP_DIR / name
+        mine = local.read_bytes() if local.exists() else b""
+        if mine.replace(b"\r\n", b"\n") != data.replace(b"\r\n", b"\n"):
+            changed[name] = data
+    return "files", len(changed), changed
+
+
+def install_files(files: dict) -> None:
+    """Swap in downloaded files, keeping copies of the old ones in backups/."""
+    for name, data in files.items():
+        if name.endswith(".py"):
+            compile(data.decode("utf-8"), name, "exec")  # refuse a broken download
+    stamp = f"{datetime.now():%Y%m%d-%H%M%S}"
+    backups = private_dir(BACKUP_DIR)
+    for name, data in files.items():
+        local = APP_DIR / name
+        if local.exists():
+            shutil.copy2(local, backups / f"{name}.{stamp}.bak")
+        tmp = local.with_name(local.name + ".new")
+        tmp.write_bytes(data)
+        os.replace(tmp, local)
+
+
 def new_project(name, path, command="", **extra) -> dict:
     p = {"name": name, "path": str(path), "command": command, "group": "",
          "tags": "", "notes": "", "console": True, "runs": 0, "last_run": "",
-         "playtime": 0, "last_exit": None, "options": [], "env": "", "image": "",
+         "playtime": 0, "daily": {}, "last_exit": None, "options": [], "env": "", "image": "",
          "favorite": False, "hidden": False}
     p.update(extra)
     return p
@@ -646,22 +961,19 @@ def make_desktop_shortcut() -> str:
     except OSError:
         ico = None
 
-    def q(s):  # PowerShell single-quoted literal
-        return "'" + str(s).replace("'", "''") + "'"
-
     lines = [
         "$d = [Environment]::GetFolderPath('Desktop')",
         "$p = Join-Path $d 'Launcher.lnk'",
         "$s = (New-Object -ComObject WScript.Shell).CreateShortcut($p)",
-        f"$s.TargetPath = {q(pyw)}",
-        f"$s.Arguments = [char]34 + {q(script)} + [char]34",
-        f"$s.WorkingDirectory = {q(APP_DIR)}",
+        f"$s.TargetPath = {ps_quote(pyw)}",
+        f"$s.Arguments = [char]34 + {ps_quote(script)} + [char]34",
+        f"$s.WorkingDirectory = {ps_quote(APP_DIR)}",
         "$s.Description = 'Project launcher'",
         "$s.Save()",
         "Write-Output $p",
     ]
     if ico:
-        lines.insert(-2, f"$s.IconLocation = {q(ico)}")
+        lines.insert(-2, f"$s.IconLocation = {ps_quote(ico)}")
     encoded = base64.b64encode("\n".join(lines).encode("utf-16-le")).decode()
     r = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
                         "-EncodedCommand", encoded],
@@ -780,7 +1092,7 @@ class ProjectDialog(tk.Toplevel):
         ttk.Checkbutton(checks, variable=self.v["console"],
                         text="Show a console window (untick for GUI apps; output goes to the log)").pack(anchor="w")
         ttk.Checkbutton(checks, variable=self.v["hidden"],
-                        text="Hide from the library (still reachable with Ctrl+K)").pack(anchor="w")
+                        text="Hide from the library (find it with Show: Hidden, or Ctrl+K)").pack(anchor="w")
 
         opts = "\n".join(f"{o['name']}: {o['command']}" for o in p.get("options", []))
         self.txt_options = self._text(body, r + 1, "More commands", 3, opts)
@@ -868,6 +1180,225 @@ class ProjectDialog(tk.Toplevel):
         self.destroy()
 
 
+# ---- new project from a template -------------------------------------------
+class NewProjectDialog(tk.Toplevel):
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self.title("New project")
+        self.configure(bg=BG)
+        self.resizable(False, False)
+
+        names = [n for n, t in TEMPLATES.items() if IS_WIN or not t.get("windows_only")]
+        self.name = tk.StringVar()
+        self.dest = tk.StringVar(value=app.cfg.get("projects_dir") or guess_projects_dir())
+        self.tpl = tk.StringVar(value=names[0])
+        self.git = tk.BooleanVar(value=bool(shutil.which("git")))
+        self.edit = tk.BooleanVar(value=bool(shutil.which(app.cfg.get("editor") or "code")))
+
+        body = ttk.Frame(self, padding=18)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(1, weight=1)
+
+        ttk.Label(body, text="Name").grid(row=0, column=0, sticky="w", padx=(0, 12), pady=4)
+        e = ttk.Entry(body, textvariable=self.name, width=46)
+        e.grid(row=0, column=1, columnspan=2, sticky="ew", pady=4)
+        ttk.Label(body, text="Create in").grid(row=1, column=0, sticky="w", padx=(0, 12), pady=4)
+        ttk.Entry(body, textvariable=self.dest).grid(row=1, column=1, sticky="ew", pady=4)
+        ttk.Button(body, text="Browse", command=self.browse).grid(row=1, column=2, padx=(6, 0))
+        ttk.Label(body, text="Template").grid(row=2, column=0, sticky="w", padx=(0, 12), pady=4)
+        ttk.Combobox(body, textvariable=self.tpl, values=names, state="readonly").grid(
+            row=2, column=1, columnspan=2, sticky="ew", pady=4)
+        self.about = ttk.Label(body, foreground=DIM, wraplength=420, justify="left",
+                               text=TEMPLATES[names[0]]["about"])
+        self.about.grid(row=3, column=1, columnspan=2, sticky="w", pady=(2, 8))
+        self.tpl.trace_add("write", lambda *_: self.about.config(text=TEMPLATES[self.tpl.get()]["about"]))
+
+        ttk.Checkbutton(body, text="Start a git repo", variable=self.git).grid(
+            row=4, column=1, columnspan=2, sticky="w")
+        ttk.Checkbutton(body, text="Open it in VS Code when it's made", variable=self.edit).grid(
+            row=5, column=1, columnspan=2, sticky="w")
+
+        btns = ttk.Frame(body)
+        btns.grid(row=6, column=0, columnspan=3, sticky="e", pady=(16, 0))
+        ttk.Button(btns, text="Cancel", command=self.destroy).pack(side="right", padx=(6, 0))
+        ttk.Button(btns, text="Create", style="Accent.TButton", command=self.create).pack(side="right")
+
+        self.bind("<Return>", lambda _: self.create())
+        self.bind("<Escape>", lambda _: self.destroy())
+        self.transient(app)
+        self.grab_set()
+        e.focus_set()
+
+    def browse(self):
+        d = filedialog.askdirectory(title="Create the project in", parent=self)
+        if d:
+            self.dest.set(d)
+
+    def create(self):
+        name = self.name.get().strip()
+        if not re.match(r"^[A-Za-z0-9][A-Za-z0-9 _.-]*$", name) or name.endswith((".", " ")):
+            messagebox.showwarning("Pick another name",
+                                   "Use letters, numbers, spaces, dashes, dots or underscores.", parent=self)
+            return
+        dest = Path(self.dest.get().strip())
+        if not dest.is_dir():
+            messagebox.showwarning("Folder not found", "Choose where to create it.", parent=self)
+            return
+        folder = dest / name
+        if folder.exists():
+            messagebox.showwarning("Already exists", f"{folder} is already there.", parent=self)
+            return
+        tpl = TEMPLATES[self.tpl.get()]
+        slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "app"
+        try:
+            folder.mkdir(parents=True)
+            for rel, text in tpl["files"].items():
+                f = folder / rel
+                f.parent.mkdir(parents=True, exist_ok=True)
+                f.write_text(text.replace("__NAME__", name).replace("__SLUG__", slug), encoding="utf-8")
+        except OSError as e:
+            messagebox.showerror("Couldn't create it", str(e), parent=self)
+            return
+        if self.git.get() and shutil.which("git"):
+            for args in (["init", "-q"], ["add", "-A"], ["commit", "-q", "-m", f"Start {name}"]):
+                try:  # the commit fails quietly if git has no user.name yet; that's fine
+                    subprocess.run(["git"] + args, cwd=str(folder), capture_output=True,
+                                   timeout=30, env=git_env(), **NO_WINDOW)
+                except (OSError, subprocess.SubprocessError):
+                    break
+        open_editor = self.edit.get()
+        self.destroy()
+
+        proj = self.app.add_folder(folder, commit=False)
+        if proj:
+            proj["console"] = tpl["console"]
+            self.app.save()
+            self.app.refresh()
+            self.app.refresh_git()
+            self.app.status.set(f"Created {name}")
+            if open_editor:
+                self.app.open_editor()
+
+
+# ---- stats -----------------------------------------------------------------
+class StatsDialog(tk.Toplevel):
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self.title("Stats")
+        self.configure(bg=BG)
+        self.geometry("840x690")
+        self.minsize(660, 640)
+        self.transient(app)
+        self.c = tk.Canvas(self, bg=BG, highlightthickness=0)
+        self.c.pack(fill="both", expand=True)
+        self.c.bind("<Configure>", lambda e: self.draw())
+        self.bind("<Escape>", lambda e: self.destroy())
+
+    def draw(self):
+        c = self.c
+        c.delete("all")
+        W = max(c.winfo_width(), 620)
+        pad = 24
+        ps = self.app.projects
+        small, bold = ("Segoe UI", 8), ("Segoe UI", 11, "bold")
+
+        today = date.today()
+        monday = today - timedelta(days=today.weekday())
+        weeks = [0.0] * 12
+        for p in ps:
+            for day, secs in (p.get("daily") or {}).items():
+                try:
+                    d = date.fromisoformat(day)
+                except (TypeError, ValueError):
+                    continue
+                ago = (monday - (d - timedelta(days=d.weekday()))).days // 7
+                if 0 <= ago < 12:
+                    weeks[11 - ago] += secs
+
+        # -- summary tiles
+        total = sum(p.get("playtime", 0) for p in ps)
+        tiles = [("Total playtime", fmt_duration(total) if total else "none yet"),
+                 ("Launches", str(sum(p.get("runs", 0) for p in ps))),
+                 ("Projects", str(len(ps))),
+                 ("This week", fmt_duration(weeks[-1]) if weeks[-1] else "nothing yet")]
+        tw = (W - pad * 2 - 12 * 3) / 4
+        for i, (label, value) in enumerate(tiles):
+            x = pad + i * (tw + 12)
+            c.create_rectangle(x, pad, x + tw, pad + 72, fill=PANEL, outline="")
+            c.create_text(x + 14, pad + 14, anchor="nw", text=label, fill=DIM, font=("Segoe UI", 9))
+            c.create_text(x + 14, pad + 34, anchor="nw", text=value, fill=TITLE, font=("Segoe UI", 16, "bold"))
+
+        # -- playtime per week
+        y = pad + 104
+        c.create_text(pad, y, anchor="nw", text="Playtime per week", fill=FG, font=bold)
+        c.create_text(W - pad, y + 3, anchor="ne", fill=DIM, font=small,
+                      text="history starts from the version that added Stats")
+        top, bottom = y + 34, y + 190
+        peak = max(weeks) or 1
+        slot = (W - pad * 2) / 12
+        for i, secs in enumerate(weeks):
+            x = pad + i * slot
+            h = (bottom - top) * secs / peak
+            c.create_rectangle(x + 6, bottom - max(h, 1), x + slot - 6, bottom,
+                               fill=ACCENT if i == 11 else PANEL2, outline="")
+            if secs >= 60:
+                label = f"{int(secs // 60)}m" if secs < 3600 else f"{secs / 3600:.1f}h"
+                c.create_text(x + slot / 2, bottom - h - 4, anchor="s", text=label, fill=DIM, font=small)
+            start = monday - timedelta(weeks=11 - i)
+            c.create_text(x + slot / 2, bottom + 6, anchor="n", text=start.strftime("%b %d"),
+                          fill=DIM, font=small)
+        if not any(weeks):
+            c.create_text(W / 2, (top + bottom) / 2, text="Play something and it'll show up here.",
+                          fill=DIM, font=FONT)
+
+        # -- most played / gathering dust, side by side
+        y = bottom + 44
+        col = (W - pad * 2 - 28) / 2
+        x1, x2 = pad, pad + col + 28
+        c.create_text(x1, y, anchor="nw", text="Most played", fill=FG, font=bold)
+        c.create_text(x2, y, anchor="nw", text="Gathering dust", fill=FG, font=bold)
+        c.create_text(x2 + col, y + 3, anchor="ne", text="not played or changed in 90 days",
+                      fill=DIM, font=small)
+        y += 32
+
+        top_ps = sorted((p for p in ps if p.get("playtime", 0) > 0),
+                        key=lambda p: p["playtime"], reverse=True)[:8]
+        best = top_ps[0]["playtime"] if top_ps else 1
+        bar_x, bar_w = x1 + col * 0.42, col * 0.38
+        for i, p in enumerate(top_ps):
+            ry = y + i * 28
+            c.create_text(x1, ry + 9, anchor="w", text=shorten(p["name"], 22), fill=FG, font=FONT)
+            c.create_rectangle(bar_x, ry + 2, bar_x + bar_w, ry + 16, fill=PANEL, outline="")
+            c.create_rectangle(bar_x, ry + 2, bar_x + max(bar_w * p["playtime"] / best, 2), ry + 16,
+                               fill=PLAY_HOT, outline="")
+            c.create_text(x1 + col, ry + 9, anchor="e", text=fmt_duration(p["playtime"]), fill=DIM, font=small)
+        if not top_ps:
+            c.create_text(x1, y + 9, anchor="w", text="Nothing played yet.", fill=DIM, font=FONT)
+
+        cutoff = (datetime.now() - timedelta(days=90)).isoformat()
+        dusty = []
+        for p in ps:
+            if not Path(p["path"]).is_dir():
+                continue
+            last = max(p.get("last_run", ""), self.app.activity.get(norm_key(p["path"]), ""))
+            if last < cutoff:
+                dusty.append((last, p))
+        dusty.sort(key=lambda t: t[0])
+        for i, (last, p) in enumerate(dusty[:8]):
+            ry = y + i * 28
+            c.create_text(x2, ry + 9, anchor="w", text=shorten(p["name"], 26), fill=FG, font=FONT)
+            c.create_text(x2 + col, ry + 9, anchor="e", fill=DIM, font=small,
+                          text=f"last touched {fmt_date(last)}" if last else "never touched")
+        if not dusty:
+            c.create_text(x2, y + 9, anchor="w", text="Everything's been touched lately. Nice.",
+                          fill=DIM, font=FONT)
+        elif len(dusty) > 8:
+            c.create_text(x2, y + 8 * 28 + 9, anchor="w", text=f"...and {len(dusty) - 8} more",
+                          fill=DIM, font=small)
+
+
 # ---- quick launch (Ctrl+K) -------------------------------------------------
 class QuickLaunch(tk.Toplevel):
     def __init__(self, app):
@@ -884,7 +1415,7 @@ class QuickLaunch(tk.Toplevel):
         self.entry = ttk.Entry(frame, textvariable=self.q, width=48, font=("Segoe UI", 12))
         self.entry.pack(fill="x")
         self.lb = tk.Listbox(frame, height=9, bg=PANEL, fg=FG, selectbackground=PANEL2,
-                             selectforeground="#ffffff", relief="flat", highlightthickness=0,
+                             selectforeground=TITLE, relief="flat", highlightthickness=0,
                              borderwidth=0, font=FONT, activestyle="none")
         self.lb.pack(fill="both", expand=True, pady=(8, 0))
         ttk.Label(frame, foreground=DIM, text="Enter to play  ·  ↑ ↓ to pick  ·  Esc to close").pack(
@@ -1187,19 +1718,22 @@ class Launcher(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Launcher")
-        self.geometry("1200x700")
-        self.minsize(900, 540)
-        self.configure(bg=BG)
+        self.geometry("1240x720")
+        self.minsize(960, 560)
 
         self.cfg, config_warning, self.can_save = load_config()
+        self.cfg["theme"] = apply_palette(self.cfg.get("theme", "Steam"))
+        self.configure(bg=BG)
         self.projects = self.cfg.setdefault("projects", [])
         self.filtered = []
         self.selected = None
-        self.scanning = False
-        self.pulling = False
+        self.scanning = self.pulling = self.shooting = False
         self.running = {}  # norm_key(path) -> info about the process started from here
         self.git_info = {}  # norm_key(path) -> git_info() result
+        self.activity = {}  # norm_key(path) -> ISO time of the latest commit or file change
         self.git_busy = self.git_again = False
+        self.update_busy = False
+        self.update_info = None
         self._cover_paths = {}  # norm_key(path) -> cover file (or None)
         self._images = {}  # (file, size) -> PhotoImage (or None)
         self.view = self.cfg.get("view", "list")
@@ -1215,6 +1749,8 @@ class Launcher(tk.Tk):
         self.refresh()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.after(400, self.refresh_git)
+        self.after(3000, self.auto_backup)
+        self.after(6000, self.check_updates)
         self.after(15000, self._tick)
 
         if config_warning:
@@ -1271,14 +1807,14 @@ class Launcher(tk.Tk):
         s.configure("Panel.TLabel", background=PANEL, foreground=FG)
         s.configure("Dim.TLabel", background=PANEL, foreground=DIM)
         s.configure("Cmd.TLabel", background=PANEL, foreground=ACCENT, font=MONO)
-        s.configure("Title.TLabel", background=PANEL, foreground="#ffffff", font=("Segoe UI", 18, "bold"))
+        s.configure("Title.TLabel", background=PANEL, foreground=TITLE, font=("Segoe UI", 18, "bold"))
         s.configure("Brand.TLabel", background=BG, foreground=ACCENT, font=("Segoe UI", 13, "bold"))
         s.configure("Status.TLabel", background=BG, foreground=DIM, font=("Segoe UI", 9))
         s.configure("TButton", background=PANEL2, foreground=FG, borderwidth=0, padding=(10, 6))
         s.map("TButton", background=[("active", ACCENT), ("disabled", PANEL)],
-              foreground=[("active", "#000000"), ("disabled", DIM)])
-        s.configure("Accent.TButton", background=ACCENT, foreground="#000000")
-        s.map("Accent.TButton", background=[("active", "#8fd3ff")])
+              foreground=[("active", ON_ACCENT), ("disabled", DIM)])
+        s.configure("Accent.TButton", background=ACCENT, foreground=ON_ACCENT)
+        s.map("Accent.TButton", background=[("active", ACCENT_HOT)])
         for name, bg, hot, pad in (("Play", PLAY, PLAY_HOT, (20, 8)), ("PlayMore", PLAY, PLAY_HOT, (6, 8)),
                                    ("Stop", STOP, STOP_HOT, (20, 8))):
             s.configure(f"{name}.TButton", background=bg, foreground="#ffffff",
@@ -1296,12 +1832,32 @@ class Launcher(tk.Tk):
         s.configure("Treeview.Heading", background=PANEL2, foreground=FG, relief="flat",
                     font=("Segoe UI", 9, "bold"), padding=6)
         s.map("Treeview.Heading", background=[("active", PANEL2)])
-        s.map("Treeview", background=[("selected", PANEL2)], foreground=[("selected", "#ffffff")])
+        s.map("Treeview", background=[("selected", PANEL2)], foreground=[("selected", TITLE)])
         s.configure("TPanedwindow", background=BG)
         s.configure("Sash", sashthickness=6)
         self.option_add("*TCombobox*Listbox.background", PANEL)
         self.option_add("*TCombobox*Listbox.foreground", FG)
         self.option_add("*TCombobox*Listbox.selectBackground", PANEL2)
+        self.option_add("*TCombobox*Listbox.selectForeground", TITLE)
+
+    def set_theme(self, name):
+        self.cfg["theme"] = apply_palette(name)
+        self.theme_var.set(self.cfg["theme"])
+        self.save()
+        self._style()
+        self.configure(bg=BG)
+        self.txt.config(bg=BG, fg=FG)
+        self.canvas.config(bg=PANEL)
+        self.grid_inner.config(bg=PANEL)
+        self._tree_tags()
+        self.refresh()
+
+    def _menu(self, parent=None):
+        return tk.Menu(parent or self, tearoff=0, bg=PANEL, fg=FG, activebackground=ACCENT,
+                       activeforeground=ON_ACCENT, selectcolor=ACCENT, borderwidth=0)
+
+    def _popup(self, menu, button):
+        menu.tk_popup(button.winfo_rootx(), button.winfo_rooty() + button.winfo_height())
 
     # -- layout --------------------------------------------------------------
     def _build(self):
@@ -1309,34 +1865,42 @@ class Launcher(tk.Tk):
         top.pack(fill="x")
         ttk.Label(top, text="Library", style="Brand.TLabel").pack(side="left")
 
-        ttk.Label(top, text="Search").pack(side="left", padx=(24, 6))
+        ttk.Label(top, text="Search").pack(side="left", padx=(20, 6))
         self.search = tk.StringVar()
         self.search.trace_add("write", lambda *_: self.refresh())
-        self.search_entry = ttk.Entry(top, textvariable=self.search, width=22)
+        self.search_entry = ttk.Entry(top, textvariable=self.search, width=20)
         self.search_entry.pack(side="left")
 
-        ttk.Label(top, text="Sort").pack(side="left", padx=(16, 6))
+        ttk.Label(top, text="Sort").pack(side="left", padx=(14, 6))
         self.sort = tk.StringVar(value="Name")
         cb = ttk.Combobox(top, textvariable=self.sort, state="readonly", width=15,
-                          values=["Name", "Recently played", "Most played", "Playtime", "Kind", "Last commit"])
+                          values=["Name", "Recently played", "Recently changed", "Most played",
+                                  "Playtime", "Kind"])
         cb.pack(side="left")
         cb.bind("<<ComboboxSelected>>", lambda e: self.refresh())
 
-        self.show_hidden = tk.BooleanVar(value=self.cfg.get("show_hidden", False))
-        ttk.Checkbutton(top, text="Hidden", variable=self.show_hidden,
-                        command=self.toggle_hidden).pack(side="left", padx=(14, 0))
+        ttk.Label(top, text="Show").pack(side="left", padx=(14, 6))
+        self.show_filter = tk.StringVar(value=self.cfg.get("show", "All"))
+        sb = ttk.Combobox(top, textvariable=self.show_filter, state="readonly", width=15,
+                          values=["All", "Favorites", "Recently changed", "Running", "Hidden"])
+        sb.pack(side="left")
+        sb.bind("<<ComboboxSelected>>", lambda e: self.on_show_change())
+
         self.btn_view = ttk.Button(top, command=self.toggle_view,
                                    text="List view" if self.view == "grid" else "Grid view")
         self.btn_view.pack(side="left", padx=(10, 0))
 
-        ttk.Button(top, text="Add project", command=self.add_project).pack(side="right")
+        self.theme_var = tk.StringVar(value=self.cfg["theme"])
+        self.btn_menu = ttk.Button(top, text="☰ Menu", command=self._show_main_menu)
+        self.btn_menu.pack(side="right")
+        ttk.Button(top, text="Add project", command=self.add_project).pack(side="right", padx=6)
         btn_scan = ttk.Button(top, text="Scan folder...", command=self.scan_folder)
-        btn_scan.pack(side="right", padx=6)
+        btn_scan.pack(side="right")
         btn_rescan = ttk.Button(top, text="Rescan", command=self.rescan)
-        btn_rescan.pack(side="right")
+        btn_rescan.pack(side="right", padx=6)
         self.scan_btns = [btn_scan, btn_rescan]
         ttk.Button(top, text="Get from GitHub...",
-                   command=lambda: GitHubDialog(self)).pack(side="right", padx=(0, 6))
+                   command=lambda: GitHubDialog(self)).pack(side="right")
 
         self.status = tk.StringVar(value="")
         bar = ttk.Frame(self)
@@ -1346,6 +1910,8 @@ class Launcher(tk.Tk):
         ttk.Button(bar, text="Pin to desktop", command=self.pin_to_desktop).pack(side="right", padx=14, pady=4)
         ttk.Button(bar, text="Remove missing", command=self.remove_missing).pack(side="right", pady=4)
         ttk.Button(bar, text="Pull all", command=self.pull_all).pack(side="right", padx=6, pady=4)
+        self.btn_update = ttk.Button(bar, text="⬆ Update available", style="Accent.TButton",
+                                     command=self.apply_update)  # packed only when there is one
 
         pane = ttk.PanedWindow(self, orient="horizontal")
         pane.pack(fill="both", expand=True, padx=14, pady=(0, 6))
@@ -1378,8 +1944,9 @@ class Launcher(tk.Tk):
         self.action_btns = []
         rows = ((("Open folder", self.open_folder), ("VS Code", self.open_editor),
                  ("Git pull", self.git_pull), ("GitHub", self.open_github)),
-                (("Log", self.open_log), ("☆ Favorite", self.toggle_favorite),
-                 ("Edit", self.edit_project), ("Remove", self.remove_project)))
+                (("Log", self.open_log), ("Screenshot ▾", self._show_shot_menu),
+                 ("☆ Favorite", self.toggle_favorite), ("Edit", self.edit_project),
+                 ("Remove", self.remove_project)))
         for spec in rows:
             row = ttk.Frame(right, style="Panel.TFrame")
             row.pack(fill="x", pady=(0, 6))
@@ -1387,7 +1954,8 @@ class Launcher(tk.Tk):
                 b = ttk.Button(row, text=text, command=cmd)
                 b.pack(side="left", padx=(0 if i == 0 else 6, 0))
                 self.action_btns.append(b)
-        self.btn_fav = self.action_btns[5]
+        self.btn_shot = self.action_btns[5]
+        self.btn_fav = self.action_btns[6]
 
         self.lbl_cmd = ttk.Label(right, style="Cmd.TLabel", wraplength=560, justify="left")
         self.lbl_cmd.pack(anchor="w", pady=(6, 10))
@@ -1409,15 +1977,13 @@ class Launcher(tk.Tk):
 
     def _build_list(self, parent):
         self.list_frame = ttk.Frame(parent)
-        self.tree = ttk.Treeview(self.list_frame, columns=("kind", "git", "commit", "last"),
+        self.tree = ttk.Treeview(self.list_frame, columns=("kind", "git", "changed", "last"),
                                  show="tree headings", selectmode="browse")
         for col, text, width in (("#0", "Project", 220), ("kind", "Kind", 70), ("git", "Git", 70),
-                                 ("commit", "Last commit", 95), ("last", "Last played", 95)):
+                                 ("changed", "Changed", 95), ("last", "Last played", 95)):
             self.tree.heading(col, text=text, anchor="w")
             self.tree.column(col, width=width, anchor="w", stretch=(col == "#0"))
-        self.tree.tag_configure("running", foreground="#8fe36a")
-        self.tree.tag_configure("hidden", foreground=DIM)
-        self.tree.tag_configure("missing", foreground="#e07a6a")
+        self._tree_tags()
         sb = ttk.Scrollbar(self.list_frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=sb.set)
         self.tree.pack(side="left", fill="both", expand=True)
@@ -1426,6 +1992,11 @@ class Launcher(tk.Tk):
         self.tree.bind("<Double-1>", self._on_double)
         self.tree.bind("<Return>", lambda e: self.launch())
         self.tree.bind("<Delete>", lambda e: self.remove_project())
+
+    def _tree_tags(self):
+        self.tree.tag_configure("running", foreground=PLAY_HOT)
+        self.tree.tag_configure("hidden", foreground=DIM)
+        self.tree.tag_configure("missing", foreground="#e07a6a")
 
     def _build_grid(self, parent):
         self.grid_frame = ttk.Frame(parent)
@@ -1455,30 +2026,68 @@ class Launcher(tk.Tk):
             self.btn_view.config(text="Grid view")
         self.refresh()
 
-    def toggle_hidden(self):
-        self.cfg["show_hidden"] = self.show_hidden.get()
+    def on_show_change(self):
+        self.cfg["show"] = self.show_filter.get()
         self.save()
         self.refresh()
 
+    def _show_main_menu(self):
+        m = self._menu()
+        m.add_command(label="New project from template...", command=lambda: NewProjectDialog(self))
+        m.add_command(label="Stats", command=lambda: StatsDialog(self))
+        m.add_separator()
+        m.add_command(label="Export library...", command=self.export_library)
+        m.add_command(label="Import library...", command=self.import_library)
+        m.add_command(label="Open backups folder", command=self.open_backups)
+        m.add_separator()
+        themes = self._menu(parent=m)
+        for name in THEMES:
+            themes.add_radiobutton(label=name, value=name, variable=self.theme_var,
+                                   command=lambda n=name: self.set_theme(n))
+        m.add_cascade(label="Theme", menu=themes)
+        m.add_separator()
+        m.add_command(label="Check for updates", command=lambda: self.check_updates(manual=True))
+        self._popup(m, self.btn_menu)
+
     # -- list + details ------------------------------------------------------
+    def _recent(self, p, days=7):
+        a = self.activity.get(norm_key(p["path"]))
+        if not a:
+            return False
+        try:
+            return (datetime.now() - datetime.fromisoformat(a)).days < days
+        except ValueError:
+            return False
+
+    def _visible(self, p):
+        show = self.show_filter.get()
+        if show == "Hidden":
+            return bool(p.get("hidden"))
+        if p.get("hidden"):
+            return False
+        if show == "Favorites":
+            return bool(p.get("favorite"))
+        if show == "Running":
+            return norm_key(p["path"]) in self.running
+        if show == "Recently changed":
+            return self._recent(p)
+        return True
+
     def refresh(self):
         q = self.search.get().lower().strip()
-        show_hidden = self.show_hidden.get()
-        items = [p for p in self.projects
-                 if (show_hidden or not p.get("hidden")) and (not q or q in
+        items = [p for p in self.projects if self._visible(p) and (not q or q in
                  f"{p['name']} {p.get('group', '')} {p.get('tags', '')} {p['path']}".lower())]
         key = self.sort.get()
         if key == "Recently played":
             items.sort(key=lambda p: p.get("last_run", ""), reverse=True)
+        elif key == "Recently changed":
+            items.sort(key=lambda p: self.activity.get(norm_key(p["path"]), ""), reverse=True)
         elif key == "Most played":
             items.sort(key=lambda p: p.get("runs", 0), reverse=True)
         elif key == "Playtime":
             items.sort(key=lambda p: p.get("playtime", 0), reverse=True)
         elif key == "Kind":
             items.sort(key=lambda p: (kind_of(p["command"]), p["name"].lower()))
-        elif key == "Last commit":
-            items.sort(key=lambda p: (self.git_info.get(norm_key(p["path"])) or {}).get("commit", ""),
-                       reverse=True)
         else:
             items.sort(key=lambda p: p["name"].lower())
         items.sort(key=lambda p: not p.get("favorite"))  # stable: favorites float to the top
@@ -1523,15 +2132,15 @@ class Launcher(tk.Tk):
                                           text=f"{g}  ({len(ps)})", values=("", "", "", ""))
             for p in ps:
                 key = norm_key(p["path"])
-                info = self.git_info.get(key)
                 tags = ("running",) if key in self.running else \
                     ("missing",) if not Path(p["path"]).is_dir() else \
                     ("hidden",) if p.get("hidden") else ()
                 iid = f"p{i}"
                 i += 1
+                changed = self.activity.get(key, "")
                 self.tree.insert(parent, "end", iid=iid, text=self._decorated_name(p), tags=tags,
-                                 values=(kind_of(p["command"]), git_short(info),
-                                         fmt_date(info["commit"]) if info and info["commit"] else "",
+                                 values=(kind_of(p["command"]), git_short(self.git_info.get(key)),
+                                         fmt_date(changed) if changed else "",
                                          fmt_date(p.get("last_run", ""))))
                 self.by_iid[iid] = p
         sel = next((k for k, v in self.by_iid.items() if v is self.selected), None)
@@ -1685,6 +2294,8 @@ class Launcher(tk.Tk):
                 path = c if c.is_file() else None
             if path is None and Path(p["path"]).is_dir():
                 path = find_cover(Path(p["path"]))
+            if path is None:
+                path = latest_shot(p)  # your own screenshots make a decent cover
             self._cover_paths[key] = path
         path = self._cover_paths[key]
         return self.load_image(path, size) if path else None
@@ -1734,6 +2345,8 @@ class Launcher(tk.Tk):
         info = self.git_info.get(key)
         if info:
             lines.append("Git: " + git_long(info))
+        elif self.activity.get(key):
+            lines.append("Files last changed " + fmt_date(self.activity[key]))
         lines.append(str(folder) + ("   (folder not found)" if missing else ""))
         return "\n".join(lines)
 
@@ -1753,8 +2366,8 @@ class Launcher(tk.Tk):
             else:
                 self.lbl_name.config(text="Nothing selected" if self.projects else "Your library is empty")
                 self.lbl_meta.config(text="Ctrl+K to find and play anything quickly." if self.projects else
-                                     "Click Scan folder and point it at the folder that holds your repos. "
-                                     "Each one becomes an entry here with a launch command guessed for it.")
+                                     "Click Scan folder and point it at the folder that holds your repos, "
+                                     "or Menu → New project to start one from a template.")
             self.lbl_cmd.config(text="")
             self._set_text("")
             return
@@ -1804,8 +2417,7 @@ class Launcher(tk.Tk):
             messagebox.showerror("Couldn't save library", str(e))
 
     def log_path(self, p) -> Path:
-        safe = re.sub(r"[^\w.-]+", "_", p["name"]).strip("_") or "project"
-        return LOG_DIR / f"{safe}-{zlib.crc32(norm_key(p['path']).encode('utf-8')):08x}.log"
+        return LOG_DIR / f"{safe_name(p)}.log"
 
     def play_or_stop(self):
         p = self.selected
@@ -1818,8 +2430,7 @@ class Launcher(tk.Tk):
         p = self.selected
         if not p:
             return
-        m = tk.Menu(self, tearoff=0, bg=PANEL, fg=FG, activebackground=ACCENT,
-                    activeforeground="#000000", borderwidth=0)
+        m = self._menu()
         m.add_command(label="▶ Play", command=self.launch)
         if p.get("options"):
             m.add_separator()
@@ -1827,8 +2438,7 @@ class Launcher(tk.Tk):
                 m.add_command(label=o["name"], command=lambda o=o: self.launch(option=o))
         m.add_separator()
         m.add_command(label="Add or change commands...", command=self.edit_project)
-        b = self.btn_more
-        m.tk_popup(b.winfo_rootx(), b.winfo_rooty() + b.winfo_height())
+        self._popup(m, self.btn_more)
 
     def launch(self, option=None, p=None):
         p = p or self.selected
@@ -1854,7 +2464,7 @@ class Launcher(tk.Tk):
         env.update(parse_env(p.get("env", "")))
         log = self.log_path(p)
         try:
-            LOG_DIR.mkdir(exist_ok=True)
+            private_dir(LOG_DIR)
             if log.exists():
                 os.replace(log, log.with_suffix(".prev.log"))  # keep the run before this one too
         except OSError:
@@ -1922,6 +2532,12 @@ class Launcher(tk.Tk):
             p["last_exit"] = code
             if not run["setup"]:
                 p["playtime"] = p.get("playtime", 0) + dur
+                # per-day history for the Stats window (about a year of it)
+                daily = p.setdefault("daily", {})
+                day = datetime.fromtimestamp(run["start"]).strftime("%Y-%m-%d")
+                daily[day] = round(daily.get(day, 0) + dur)
+                for old in sorted(daily)[:-400]:
+                    del daily[old]
             elif code == 0:
                 self._after_setup(p)
             self.save()
@@ -1983,6 +2599,305 @@ class Launcher(tk.Tk):
             messagebox.showinfo("Nothing to set up", f"{p['name']} already looks ready to run.")
             return
         self.launch(option={"name": "Set up", "command": cmd, "setup": True}, p=p)
+
+    # -- screenshots ---------------------------------------------------------
+    def _show_shot_menu(self):
+        if not self.selected:
+            return
+        m = self._menu()
+        m.add_command(label="Take screenshot in 3 seconds", command=self.take_screenshot)
+        m.add_command(label="Open screenshots folder", command=self.open_shots)
+        m.add_command(label="Use latest as cover", command=self.use_latest_shot)
+        self._popup(m, self.btn_shot)
+
+    def take_screenshot(self, delay=3):
+        p = self.selected
+        if not p or self.shooting:
+            return
+        try:
+            folder = private_dir(SHOT_DIR) / safe_name(p)
+            folder.mkdir(exist_ok=True)
+        except OSError as e:
+            messagebox.showerror("Couldn't make the screenshots folder", str(e))
+            return
+        path = folder / f"{datetime.now():%Y-%m-%d_%H-%M-%S}.png"
+        cmd = screenshot_command(path, delay)
+        if not cmd:
+            messagebox.showinfo("Not available here",
+                                "Screenshots need gnome-screenshot or scrot on Linux.")
+            return
+        self.shooting = True
+        self.status.set(f"Screenshot in {delay} seconds. Click into the window you want...")
+        hide = IS_WIN  # get the launcher out of the way so it isn't the window in front
+        if hide:
+            self.iconify()
+
+        def work():
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=delay + 60, **NO_WINDOW)
+                err = "" if r.returncode == 0 and path.exists() else (r.stderr.strip() or "no image was saved")
+            except Exception as e:
+                err = str(e)
+            self.call_soon(self._shot_done, p, path, err, hide)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _shot_done(self, p, path, err, hide):
+        self.shooting = False
+        if hide:
+            self.deiconify()
+            self.lift()
+        if err:
+            self.status.set("Screenshot failed")
+            messagebox.showerror("Screenshot failed", err)
+            return
+        self._cover_paths.pop(norm_key(p["path"]), None)  # it may now be the cover
+        self.refresh()
+        self.status.set(f"Saved screenshot of {p['name']}: {path.name}")
+
+    def open_shots(self):
+        p = self.selected
+        if not p:
+            return
+        if not latest_shot(p):
+            messagebox.showinfo("No screenshots yet", f"Take one with Screenshot ▾ while {p['name']} is running.")
+            return
+        self.open_path(shots_dir(p))
+
+    def use_latest_shot(self):
+        p = self.selected
+        if not p:
+            return
+        shot = latest_shot(p)
+        if not shot:
+            messagebox.showinfo("No screenshots yet", "Take one first with Screenshot ▾.")
+            return
+        p["image"] = str(shot)
+        self._cover_paths.pop(norm_key(p["path"]), None)
+        self.save()
+        self.refresh()
+
+    # -- backups -------------------------------------------------------------
+    def auto_backup(self, force=False):
+        """A copy of the library in backups/ at most once a day (keeps the last 10)."""
+        if not self.projects or not self.can_save:
+            return None
+        try:
+            d = private_dir(BACKUP_DIR)
+            existing = sorted(d.glob("auto-*.json"))
+            if not force and existing and time.time() - existing[-1].stat().st_mtime < 20 * 3600:
+                return None
+            path = d / f"auto-{datetime.now():%Y%m%d-%H%M%S}.json"
+            path.write_text(json.dumps(library_snapshot(self.cfg), indent=2), encoding="utf-8")
+            for old in sorted(d.glob("auto-*.json"))[:-10]:
+                old.unlink()
+            return path
+        except OSError:
+            return None
+
+    def open_backups(self):
+        try:
+            self.open_path(private_dir(BACKUP_DIR))
+        except OSError as e:
+            messagebox.showerror("Couldn't open backups", str(e))
+
+    def export_library(self):
+        f = filedialog.asksaveasfilename(
+            title="Export library", defaultextension=".json",
+            initialfile=f"launcher-library-{datetime.now():%Y-%m-%d}.json",
+            filetypes=[("Launcher library", "*.json"), ("All files", "*.*")])
+        if not f:
+            return
+        try:
+            Path(f).write_text(json.dumps(library_snapshot(self.cfg), indent=2), encoding="utf-8")
+        except OSError as e:
+            messagebox.showerror("Couldn't export", str(e))
+            return
+        messagebox.showinfo("Exported",
+                            f"Saved {len(self.projects)} projects to\n{f}\n\n"
+                            "Your GitHub token isn't included. On another PC, use Menu → Import library.")
+
+    def import_library(self):
+        f = filedialog.askopenfilename(title="Import library",
+                                       filetypes=[("Launcher library", "*.json"), ("All files", "*.*")])
+        if not f:
+            return
+        try:
+            data = json.loads(Path(f).read_text(encoding="utf-8"))
+            incoming = data.get("projects") if isinstance(data, dict) else None
+            if not isinstance(incoming, list):
+                raise ValueError("there's no project list in it")
+        except (OSError, ValueError) as e:
+            messagebox.showerror("Couldn't import", f"That file isn't a launcher library: {e}")
+            return
+
+        # a backup from another PC: its paths probably start somewhere else
+        old_root, new_root = data.get("projects_dir", ""), self.cfg.get("projects_dir", "")
+        remap = False
+        if old_root and new_root and norm_key(old_root) != norm_key(new_root):
+            under = sum(1 for q in incoming if isinstance(q, dict) and
+                        remap_path(str(q.get("path", "")), old_root, new_root) != q.get("path"))
+            if under:
+                remap = messagebox.askyesno(
+                    "Different projects folder",
+                    f"In this backup, projects lived in:\n{old_root}\n\nHere they live in:\n{new_root}\n\n"
+                    f"Point {under} entr{'y' if under == 1 else 'ies'} at the matching folders here?")
+
+        choice = messagebox.askyesnocancel(
+            "Import library",
+            f"{len(incoming)} projects in this file.\n\n"
+            "Yes: merge them into your library (keeps the best of both)\n"
+            "No: replace your library with them\n\n"
+            "Your current library is backed up first either way.")
+        if choice is None:
+            return
+        self.auto_backup(force=True)
+
+        cleaned = []
+        for q in incoming:
+            if not isinstance(q, dict) or not q.get("name") or not q.get("path"):
+                continue
+            full = new_project(q["name"], q["path"])
+            full.update(q)
+            if remap:
+                full["path"] = remap_path(str(full["path"]), old_root, new_root)
+            cleaned.append(full)
+
+        if choice is False:
+            self.projects.clear()
+            self.projects.extend(cleaned)
+            msg = f"Replaced your library with {len(cleaned)} projects."
+        else:
+            by_key = {norm_key(p["path"]): p for p in self.projects}
+            added = merged = 0
+            for q in cleaned:
+                mine = by_key.get(norm_key(q["path"]))
+                if mine is None:
+                    self.projects.append(q)
+                    by_key[norm_key(q["path"])] = q
+                    added += 1
+                    continue
+                merged += 1
+                mine["runs"] = max(mine.get("runs", 0), q.get("runs", 0))
+                mine["playtime"] = max(mine.get("playtime", 0), q.get("playtime", 0))
+                mine["last_run"] = max(mine.get("last_run", ""), q.get("last_run", ""))
+                mine["favorite"] = bool(mine.get("favorite") or q.get("favorite"))
+                for field in ("command", "notes", "tags", "group", "image", "env", "options"):
+                    if not mine.get(field) and q.get(field):
+                        mine[field] = q[field]
+                daily = mine.setdefault("daily", {})
+                for day, secs in (q.get("daily") or {}).items():
+                    daily[day] = max(daily.get(day, 0), secs)
+            msg = f"Added {added} new project{'s' if added != 1 else ''}, merged {merged} you already had."
+        self.selected = None
+        self._cover_paths.clear()
+        self._images.clear()
+        self.save()
+        self.refresh()
+        self.refresh_git()
+        missing = sum(1 for p in self.projects if not Path(p["path"]).is_dir())
+        if missing:
+            msg += (f"\n\n{missing} point to folders that aren't on this PC. Use Get from GitHub to "
+                    "download them, or Remove missing to tidy up.")
+        messagebox.showinfo("Imported", msg)
+
+    # -- updates -------------------------------------------------------------
+    def check_updates(self, manual=False):
+        if self.update_busy:
+            return
+        if not manual:
+            last = self.cfg.get("last_update_check", "")
+            try:
+                if last and datetime.now() - datetime.fromisoformat(last) < timedelta(hours=12):
+                    return
+            except ValueError:
+                pass
+        self.update_busy = True
+        if manual:
+            self.status.set("Checking for updates...")
+
+        def work():
+            try:
+                result = check_for_update()
+            except Exception as e:
+                result = ("error", 0, str(e))
+            self.call_soon(self._update_checked, result, manual)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _update_checked(self, result, manual):
+        self.update_busy = False
+        kind, n, detail = result
+        if kind == "error":
+            if manual:
+                self.status.set("Couldn't check for updates")
+                messagebox.showerror("Couldn't check for updates", detail)
+            return
+        self.cfg["last_update_check"] = datetime.now().isoformat(timespec="seconds")
+        self.save()
+        if not n:
+            self.update_info = None
+            self.btn_update.pack_forget()
+            if manual:
+                self.status.set("Launcher is up to date")
+                messagebox.showinfo("Up to date", "You've got the latest Launcher.")
+            return
+        self.update_info = result
+        self.btn_update.pack(side="right", padx=(0, 6), pady=4)
+        self.status.set("A Launcher update is available")
+        if manual:
+            self.apply_update()
+
+    def apply_update(self):
+        if not self.update_info:
+            return
+        kind, n, detail = self.update_info
+        if kind == "git":
+            q = (f"There {'is' if n == 1 else 'are'} {n} new commit{'s' if n != 1 else ''} for the "
+                 "Launcher on GitHub. Pull and restart?")
+        else:
+            q = (f"A newer {' and '.join(detail)} is on GitHub. Your current "
+                 f"{'copy is' if len(detail) == 1 else 'copies are'} kept in the backups folder. "
+                 "Update and restart?")
+        if self.running:
+            q += ("\n\nThings you started from here keep running, but their playtime won't be recorded.")
+        if not messagebox.askyesno("Update Launcher", q):
+            return
+        self.status.set("Updating...")
+
+        def work():
+            try:
+                if kind == "git":
+                    r = subprocess.run(["git", "pull", "--ff-only"], cwd=str(APP_DIR), capture_output=True,
+                                       text=True, timeout=120, env=git_env(), **NO_WINDOW)
+                    if r.returncode:
+                        raise OSError((r.stdout + r.stderr).strip() or "git pull failed")
+                else:
+                    install_files(detail)
+                self.call_soon(self._updated, None)
+            except Exception as e:
+                self.call_soon(self._updated, e)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _updated(self, err):
+        if err:
+            self.status.set("Update failed")
+            messagebox.showerror("Update failed", f"{err}\n\nThe Launcher you have now still works.")
+            return
+        self.restart()
+
+    def restart(self):
+        self.save()
+        exe = Path(sys.executable)
+        pyw = exe.with_name("pythonw.exe")
+        if IS_WIN and pyw.exists():
+            exe = pyw
+        try:
+            subprocess.Popen([str(exe), str(Path(__file__).resolve())], cwd=str(APP_DIR))
+        except OSError as e:
+            messagebox.showinfo("Updated", f"Updated! Couldn't restart by itself ({e}), so please open it again.")
+        self.destroy()
 
     # -- other actions -------------------------------------------------------
     def open_path(self, path):
@@ -2131,24 +3046,34 @@ class Launcher(tk.Tk):
         self.refresh_git()
 
     def refresh_git(self):
-        """Look up git status for every repo in the background, then redraw."""
-        if not shutil.which("git"):
-            return
+        """Git status and latest file changes for every project, in the background."""
         if self.git_busy:
             self.git_again = True
             return
         self.git_busy = True
+        have_git = bool(shutil.which("git"))
         folders = [(norm_key(p["path"]), Path(p["path"])) for p in self.projects
-                   if Path(p["path"]).is_dir() and is_repo(Path(p["path"]))]
+                   if Path(p["path"]).is_dir()]
 
         def work():
-            self.call_soon(self._git_done, {k: git_info(f) for k, f in folders})
+            infos, activity = {}, {}
+            for k, f in folders:
+                info = git_info(f) if have_git and is_repo(f) else None
+                if info:
+                    infos[k] = info
+                # in a clean repo the last commit says it all; otherwise look at the files
+                mod = newest_change(f) if info is None or info["changed"] else ""
+                a = max(info["commit"] if info else "", mod)
+                if a:
+                    activity[k] = a
+            self.call_soon(self._git_done, infos, activity)
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _git_done(self, results):
+    def _git_done(self, infos, activity):
         self.git_busy = False
-        self.git_info = {k: v for k, v in results.items() if v}
+        self.git_info = infos
+        self.activity = activity
         self.refresh()
         if self.git_again:
             self.git_again = False
