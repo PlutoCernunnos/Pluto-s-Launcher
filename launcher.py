@@ -6,8 +6,8 @@ launcher.py - a Steam-style library for your own projects.
 
 "Scan folder..."  -> point it at the folder where your repos live. Every
                      subfolder becomes an entry with an auto-detected launch
-                     command (run*.bat, any .bat, .exe, main.py, .ps1,
-                     npm start, cargo run, ...).
+                     command (run*.bat, .exe, main.py, .ps1, npm start,
+                     cargo run, ...).
 "Add project"     -> any folder + any command, Python or not.
 
 Per project: Play, Open folder, Git pull, open on GitHub, README preview,
@@ -20,6 +20,7 @@ launcher_config.json, so keep the two together.
 import base64
 import json
 import os
+import queue
 import re
 import shutil
 import struct
@@ -31,6 +32,7 @@ import urllib.request
 import webbrowser
 from datetime import datetime
 from pathlib import Path
+
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
@@ -47,12 +49,12 @@ MONO = ("Consolas", 9)
 
 SKIP_DIRS = {"__pycache__", "node_modules", ".git", ".venv", "venv", "env",
              ".idea", ".vscode", "dist", "build"}
-MAX_DEPTH = 3  # how many folder levels a scan will descend looking for projects
+MAX_DEPTH = 3  # projects can sit at most this many folder levels below the scanned folder
 
 # (glob patterns tried in order, command template, windows-only?)
 LAUNCH_RULES = [
-    (["run*.bat", "start*.bat", "launch*.bat", "play*.bat", "*.bat", "*.cmd"],
-     "call {f}", True),
+    (["run*.bat", "start*.bat", "launch*.bat", "play*.bat",
+      "run*.cmd", "start*.cmd", "launch*.cmd", "play*.cmd"], "call {f}", True),
     (["*.exe"], "{f}", True),
     (["main.py", "app.py", "game.py", "run.py", "start.py", "__main__.py"],
      "{py} {f}", False),
@@ -62,11 +64,35 @@ LAUNCH_RULES = [
     (["Cargo.toml"], "cargo run", False),
     (["go.mod"], "go run .", False),
 ]
+# Tried only after everything above *and* the "<folder>.py / lone .py" checks,
+# so a stray setup.bat or build.bat doesn't beat the project's real entry point.
+LAST_RESORT_RULES = [
+    (["*.bat", "*.cmd"], "call {f}", True),
+]
+# .exe files that are almost never the thing you want to "play"
+SKIP_EXE = re.compile(r"^(unins\d*|uninstall|setup|install|.*installer|vc_?redist)", re.I)
+
+# characters that make cmd.exe or bash misread an unquoted file name
+SHELL_SPECIAL = set(" &()[]{}^=;!'+,`~%$")
 
 
 # ---- helpers ---------------------------------------------------------------
 def _q(name: str) -> str:
-    return f'"{name}"' if " " in name else name
+    return f'"{name}"' if any(c in SHELL_SPECIAL for c in name) else name
+
+
+def norm_key(path) -> str:
+    """Comparable form of a path, for spotting duplicates."""
+    return os.path.normcase(os.path.normpath(str(path)))
+
+
+def is_repo(folder: Path) -> bool:
+    # .git is a *file* in submodules and worktrees, so don't insist on a folder
+    return (folder / ".git").exists()
+
+
+def has_user_data(p: dict) -> bool:
+    return bool(p.get("notes") or p.get("tags") or p.get("runs"))
 
 
 def find_python(folder: Path) -> str:
@@ -78,22 +104,30 @@ def find_python(folder: Path) -> str:
     return "python" if IS_WIN else "python3"
 
 
-def detect_command(folder: Path) -> str:
-    """Best guess at how to run whatever lives in `folder`. '' if no idea."""
-    for patterns, template, win_only in LAUNCH_RULES:
+def _first_match(folder: Path, rules):
+    for patterns, template, win_only in rules:
         if win_only and not IS_WIN:
             continue
         for pat in patterns:
-            hits = sorted(p for p in folder.glob(pat) if p.is_file())
+            hits = sorted(p for p in folder.glob(pat) if p.is_file()
+                          and not (pat == "*.exe" and SKIP_EXE.match(p.name)))
             if hits:
                 return template.format(f=_q(hits[0].name), py=find_python(folder))
+    return ""
+
+
+def detect_command(folder: Path) -> str:
+    """Best guess at how to run whatever lives in `folder`. '' if no idea."""
+    cmd = _first_match(folder, LAUNCH_RULES)
+    if cmd:
+        return cmd
     same = folder / f"{folder.name}.py"
     if same.is_file():
         return f"{find_python(folder)} {_q(same.name)}"
     pys = [p for p in folder.glob("*.py") if p.is_file()]
     if len(pys) == 1:
         return f"{find_python(folder)} {_q(pys[0].name)}"
-    return ""
+    return _first_match(folder, LAST_RESORT_RULES)
 
 
 def kind_of(cmd: str) -> str:
@@ -120,13 +154,23 @@ def kind_of(cmd: str) -> str:
 
 
 def github_url(folder: Path) -> str:
+    """Web URL of the repo's origin remote, with any user:token@ stripped out."""
     cfg = folder / ".git" / "config"
-    if not cfg.exists():
+    if not cfg.is_file():
         return ""
-    m = re.search(r"url\s*=\s*(\S+)", cfg.read_text(errors="ignore"))
+    try:
+        text = cfg.read_text(errors="ignore")
+    except OSError:
+        return ""
+    # prefer [remote "origin"]; fall back to the first url anywhere in the file
+    m = re.search(r'^\s*\[remote "origin"\](.*?)(?=^\s*\[|\Z)', text, re.S | re.M)
+    m = re.search(r"^\s*url\s*=\s*(\S+)", m.group(1) if m else text, re.M)
     if not m:
         return ""
-    url = re.sub(r"^git@([^:]+):", r"https://\1/", m.group(1))
+    url = m.group(1)
+    url = re.sub(r"^git@([^:]+):", r"https://\1/", url)
+    url = re.sub(r"^ssh://git@([^/:]+)(:\d+)?/", r"https://\1/", url)
+    url = re.sub(r"^(https?://)[^/@]+@", r"\1", url)  # drop credentials
     url = re.sub(r"\.git$", "", url)
     return url if url.startswith("http") else ""
 
@@ -159,38 +203,81 @@ def fmt_date(iso: str) -> str:
     return d.strftime("%b %d, %Y")
 
 
-def load_config() -> dict:
-    if CONFIG_FILE.exists():
-        try:
-            return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            pass
+def utc_to_local(stamp: str) -> str:
+    """GitHub's '2026-10-06T18:13:00Z' -> naive local-time ISO string for fmt_date."""
+    if not stamp:
+        return ""
+    try:
+        d = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+        return d.astimezone().replace(tzinfo=None).isoformat(timespec="seconds")
+    except ValueError:
+        return ""
+
+
+def default_config() -> dict:
     return {"projects_dir": "", "editor": "code", "github_user": "", "github_token": "",
             "projects": []}
 
 
-def fetch_github_repos(user: str, token: str = "") -> list:
-    """Repos for `user` from the GitHub API. Public only, unless a token is given
-    (then it lists everything the token's owner has, private included)."""
-    headers = {"Accept": "application/vnd.github+json", "User-Agent": "launcher.py"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-        base = "https://api.github.com/user/repos?affiliation=owner&sort=pushed&per_page=100"
-    else:
-        base = f"https://api.github.com/users/{user}/repos?sort=pushed&per_page=100"
-    repos = []
-    for page in range(1, 6):  # up to 500 repos
-        req = urllib.request.Request(f"{base}&page={page}", headers=headers)
-        with urllib.request.urlopen(req, timeout=20) as r:
-            batch = json.load(r)
-        repos.extend(batch)
-        if len(batch) < 100:
-            break
-    return repos
+def load_config():
+    """Returns (config, warning, safe_to_save). A broken config file is backed up
+    rather than silently replaced, so a bad write can't wipe the library."""
+    if not CONFIG_FILE.exists():
+        return default_config(), "", True
+    try:
+        cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        if not isinstance(cfg, dict):
+            raise ValueError("not a JSON object")
+        return cfg, "", True
+    except (OSError, ValueError) as e:
+        backup = CONFIG_FILE.with_name(
+            f"{CONFIG_FILE.stem}.broken-{datetime.now():%Y%m%d-%H%M%S}.json")
+        try:
+            shutil.copy2(CONFIG_FILE, backup)
+        except OSError:
+            return (default_config(),
+                    f"Couldn't read {CONFIG_FILE.name} ({e}) or back it up, so the launcher "
+                    "won't save anything this session. Your file has been left untouched.",
+                    False)
+        return (default_config(),
+                f"Couldn't read {CONFIG_FILE.name} ({e}). Starting with an empty library; "
+                f"the old file was copied to {backup.name} so nothing is lost.",
+                True)
 
 
 def save_config(cfg: dict) -> None:
-    CONFIG_FILE.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    # write to a temp file and swap it in, so a crash mid-write can't corrupt the library
+    tmp = CONFIG_FILE.with_name(CONFIG_FILE.name + ".tmp")
+    tmp.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    os.replace(tmp, CONFIG_FILE)
+
+
+def _get_json(url: str, headers: dict):
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.load(r)
+
+
+def fetch_github_repos(user: str, token: str = ""):
+    """Returns (repos, login). The token is only used when `user` is blank or is the
+    token's owner, so nobody else's list gets your private repos mixed into it.
+    `login` is the token owner's username, or '' without a token."""
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": "launcher.py"}
+    login = ""
+    base = f"https://api.github.com/users/{user}/repos?sort=pushed&per_page=100"
+    if token:
+        auth = dict(headers, Authorization=f"Bearer {token}")
+        login = _get_json("https://api.github.com/user", auth).get("login", "")
+        if not user or user.lower() == login.lower():
+            headers = auth
+            base = "https://api.github.com/user/repos?affiliation=owner&sort=pushed&per_page=100"
+    repos = []
+    for page in range(1, 6):  # up to 500 repos
+        batch = _get_json(f"{base}&page={page}", headers)
+        repos.extend(batch)
+        if len(batch) < 100:
+            break
+    return repos, login
 
 
 def new_project(name, path, command="", **extra) -> dict:
@@ -198,6 +285,57 @@ def new_project(name, path, command="", **extra) -> dict:
          "tags": "", "notes": "", "console": True, "runs": 0, "last_run": ""}
     p.update(extra)
     return p
+
+
+def subdirs(folder: Path):
+    try:
+        return sorted((s for s in folder.iterdir() if s.is_dir()
+                       and not s.name.startswith(".") and s.name not in SKIP_DIRS),
+                      key=lambda s: s.name.lower())
+    except OSError:
+        return []
+
+
+def plan_scan(root: Path, known: dict) -> list:
+    """The slow half of a scan; runs on a worker thread and only reads the disk.
+
+    `known` maps norm_key(path) of each library entry to 'project' (has a command),
+    'placeholder' (no command, no notes/tags/plays) or 'kept' (no command, but has
+    your data). Returns (step, key, folder, command, group) tuples for the main
+    thread to apply."""
+    steps = []
+
+    def walk(folder, group, depth):
+        for d in subdirs(folder):
+            key = norm_key(d)
+            cmd = detect_command(d)
+            kids = subdirs(d)
+            # A folder is a *group* (not a project) if nothing runs at its top level,
+            # it isn't a repo itself, there's room to go deeper, and it is either a
+            # direct child of the scan root or holds something that looks like a project.
+            is_group = bool(
+                not cmd and kids and depth < MAX_DEPTH - 1 and not is_repo(d) and
+                (depth == 0 or any(is_repo(k) or detect_command(k) for k in kids)))
+
+            state = known.get(key)
+            if state is not None:
+                if is_group and state == "placeholder":
+                    # an older scan added this as a '?' entry; its contents are the real projects
+                    steps.append(("replace", key, d, "", group))
+                elif is_group and state == "kept":
+                    steps.append(("kept", key, d, "", group))
+                    continue
+                else:
+                    steps.append(("existing", key, d, "", group))
+                    continue
+
+            if is_group:
+                walk(d, f"{group}/{d.name}" if group else d.name, depth + 1)
+            else:
+                steps.append(("new", key, d, cmd, group))
+
+    walk(root, "", 0)
+    return steps
 
 
 def make_icon(path: Path, size: int = 128) -> None:
@@ -282,6 +420,7 @@ class ProjectDialog(tk.Toplevel):
         self.resizable(False, False)
         self.result = None
         p = project or {}
+
         self.v = {
             "name": tk.StringVar(value=p.get("name", "")),
             "path": tk.StringVar(value=p.get("path", "")),
@@ -304,8 +443,8 @@ class ProjectDialog(tk.Toplevel):
                 ttk.Button(body, text="Browse", command=self.browse).grid(row=row, column=2, padx=(6, 0))
             if key == "command":
                 ttk.Button(body, text="Detect", command=self.detect).grid(row=row, column=2, padx=(6, 0))
-        r = len(rows)
 
+        r = len(rows)
         ttk.Checkbutton(body, text="Show a console window (uncheck for GUI-only apps)",
                         variable=self.v["console"]).grid(row=r, column=1, columnspan=2, sticky="w", pady=4)
 
@@ -389,6 +528,7 @@ class GitHubDialog(tk.Toplevel):
         top = ttk.Frame(self, padding=(16, 14, 16, 4))
         top.pack(fill="x")
         top.columnconfigure(1, weight=1)
+
         ttk.Label(top, text="GitHub user").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=4)
         self.user = tk.StringVar(value=app.cfg.get("github_user") or app.guess_github_user())
         self.user_box = e = ttk.Combobox(top, textvariable=self.user, values=app.cfg.get("github_users", []))
@@ -397,10 +537,12 @@ class GitHubDialog(tk.Toplevel):
         e.bind("<<ComboboxSelected>>", lambda _: self.load())
         ttk.Button(top, text="Load repos", style="Accent.TButton",
                    command=self.load).grid(row=0, column=2, padx=(6, 0))
+
         ttk.Label(top, text="Download into").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=4)
         self.dest = tk.StringVar(value=app.cfg.get("projects_dir", ""))
         ttk.Entry(top, textvariable=self.dest).grid(row=1, column=1, sticky="ew", pady=4)
         ttk.Button(top, text="Browse", command=self.browse).grid(row=1, column=2, padx=(6, 0))
+
         ttk.Label(top, foreground=DIM, wraplength=700, justify="left",
                   text="Any GitHub username works here, not just yours. Shows public repos; to include "
                        f"your private ones, put a GitHub token in \"github_token\" in {CONFIG_FILE.name}. "
@@ -454,7 +596,7 @@ class GitHubDialog(tk.Toplevel):
         if sel:
             r = self.repos[int(sel[0])]
             self.desc.config(text=(r.get("description") or "No description.") +
-                                  f"    {r['html_url']}")
+                             f"    {r['html_url']}")
 
     def load(self):
         user = self.user.get().strip()
@@ -462,35 +604,40 @@ class GitHubDialog(tk.Toplevel):
         if not user and not token:
             messagebox.showwarning("Who?", "Type a GitHub username first.", parent=self)
             return
-        # a token lists *its owner's* repos, so only use it when looking at your own account
-        own = self.app.cfg.get("github_user", "")
-        if user and own and user.lower() != own.lower():
-            token = ""
-        elif user:
-            self.app.cfg["github_user"] = user
-        users = self.app.cfg.setdefault("github_users", [])
-        if user and user not in users:
-            users.append(user)
-            self.user_box.config(values=users)
-        self.app.save()
         self.set_msg(f"Loading repos for {user or 'your token'}...")
         self.btn_get.config(state="disabled")
 
         def work():
             try:
-                repos = fetch_github_repos(user, token)
-                self.after(0, self.show_repos, repos)
+                repos, login = fetch_github_repos(user, token)
+                self.app.call_soon(self.loaded, user, repos, login)
             except urllib.error.HTTPError as e:
                 msg = {404: f"No GitHub user called '{user}'.",
                        403: "GitHub is rate-limiting this computer (60 lookups an hour without a token). Try again later.",
                        401: f"GitHub rejected the token in {CONFIG_FILE.name}."}.get(
                     e.code, f"GitHub answered {e.code} {e.reason}.")
-                self.after(0, self.fail, msg)
+                self.app.call_soon(self.fail, msg)
             except Exception as e:
-                msg = f"Couldn't reach GitHub: {e}"
-                self.after(0, self.fail, msg)
+                self.app.call_soon(self.fail, f"Couldn't reach GitHub: {e}")
 
         threading.Thread(target=work, daemon=True).start()
+
+    def loaded(self, user, repos, login):
+        cfg = self.app.cfg
+        if login:
+            # the token's owner is, by definition, you
+            cfg["github_user"] = login
+        elif user and not cfg.get("github_user") and not cfg.get("github_token"):
+            cfg["github_user"] = user
+        name = user or login
+        users = cfg.setdefault("github_users", [])
+        if name and name not in users:
+            users.append(name)
+        self.app.save()
+        self.user_box.config(values=users)
+        if not user and login:
+            self.user.set(login)
+        self.show_repos(repos)
 
     def fail(self, msg):
         self.set_msg(msg)
@@ -508,9 +655,9 @@ class GitHubDialog(tk.Toplevel):
                 loose_names.add(p["name"].lower())
         for i, r in enumerate(repos):
             in_lib = r["html_url"].lower() in have_urls or r["name"].lower() in loose_names
-            pushed = (r.get("pushed_at") or "").rstrip("Z")
             self.tree.insert("", "end", iid=str(i), text=r["name"],
-                             values=(r.get("language") or "", fmt_date(pushed),
+                             values=(r.get("language") or "",
+                                     fmt_date(utc_to_local(r.get("pushed_at") or "")),
                                      "In library" if in_lib else "Not downloaded"))
         self.btn_get.config(state="normal")
         self.set_msg(f"{len(repos)} repos. Select the ones you want, then Download selected.")
@@ -531,42 +678,53 @@ class GitHubDialog(tk.Toplevel):
                                  "git isn't installed or isn't on PATH. Get it from git-scm.com.",
                                  parent=self)
             return
+
         self.busy = True
         self.btn_get.config(state="disabled")
 
         def work():
             results = []
             kw = {"creationflags": subprocess.CREATE_NO_WINDOW} if IS_WIN else {}
+            # fail fast instead of waiting on a password prompt nobody can see
+            env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
             for n, r in enumerate(picked, 1):
                 target = dest / r["name"]
-                self.after(0, self.set_msg, f"Downloading {r['name']} ({n} of {len(picked)})...")
+                self.app.call_soon(self.set_msg, f"Downloading {r['name']} ({n} of {len(picked)})...")
                 if target.exists():
                     results.append((r, target, "ok"))  # already on disk; just add it
                     continue
                 try:
                     res = subprocess.run(["git", "clone", r["clone_url"], str(target)],
-                                         capture_output=True, text=True, timeout=900, **kw)
+                                         capture_output=True, text=True, timeout=900,
+                                         env=env, **kw)
                     err = res.stderr.strip().splitlines()
                     results.append((r, target, "ok" if res.returncode == 0
                                     else (err[-1] if err else "git clone failed")))
                 except Exception as e:
                     results.append((r, target, f"failed: {e}"))
-            self.after(0, self.finish, results)
+            self.app.call_soon(self.finish, results)
 
         threading.Thread(target=work, daemon=True).start()
 
     def finish(self, results):
-        self.busy = False
-        self.btn_get.config(state="normal")
+        # library work first, so it still happens if this dialog was closed mid-download
         added, problems = 0, []
         for r, target, result in results:
             if result == "ok":
-                added += self.app.add_folder(target)
+                added += self.app.add_folder(target, commit=False)
             else:
                 problems.append(f"{r['name']}: {result}")
+        if added:
+            self.app.save()
+            self.app.refresh()
+        self.busy = False
         msg = f"Added {added} project{'s' if added != 1 else ''} to the library."
         if problems:
             msg += "\n\nProblems:\n" + "\n".join(problems)
+        if not self.winfo_exists():
+            self.app.status.set(msg.splitlines()[0])
+            return
+        self.btn_get.config(state="normal")
         self.set_msg(msg.splitlines()[0])
         self.show_repos(self.repos)
         messagebox.showinfo("Download finished", msg, parent=self)
@@ -580,13 +738,39 @@ class Launcher(tk.Tk):
         self.geometry("1060x660")
         self.minsize(840, 520)
         self.configure(bg=BG)
-        self.cfg = load_config()
+
+        self.cfg, config_warning, self.can_save = load_config()
         self.projects = self.cfg.setdefault("projects", [])
         self.filtered = []
         self.selected = None
+        self.scanning = False
+
+        # worker threads hand results back through this; only the main thread touches tkinter
+        self._calls = queue.Queue()
+        self.after(50, self._pump)
+
         self._style()
         self._build()
         self.refresh()
+        if config_warning:
+            self.after(200, lambda: messagebox.showwarning("Library file problem", config_warning))
+
+    # -- threading -----------------------------------------------------------
+    def call_soon(self, fn, *args):
+        """Safe to call from any thread: runs fn(*args) on the tkinter thread."""
+        self._calls.put((fn, args))
+
+    def _pump(self):
+        try:
+            while True:
+                fn, args = self._calls.get_nowait()
+                try:
+                    fn(*args)
+                except tk.TclError:
+                    pass  # the window it was meant for has been closed
+        except queue.Empty:
+            pass
+        self.after(50, self._pump)
 
     # -- looks ---------------------------------------------------------------
     def _style(self):
@@ -634,20 +818,26 @@ class Launcher(tk.Tk):
         top = ttk.Frame(self, padding=(14, 12))
         top.pack(fill="x")
         ttk.Label(top, text="Library", style="Brand.TLabel").pack(side="left")
+
         ttk.Label(top, text="Search").pack(side="left", padx=(24, 6))
         self.search = tk.StringVar()
         self.search.trace_add("write", lambda *_: self.refresh())
         self.search_entry = ttk.Entry(top, textvariable=self.search, width=26)
         self.search_entry.pack(side="left")
+
         ttk.Label(top, text="Sort").pack(side="left", padx=(16, 6))
         self.sort = tk.StringVar(value="Name")
         cb = ttk.Combobox(top, textvariable=self.sort, state="readonly", width=16,
                           values=["Name", "Recently played", "Most played", "Kind"])
         cb.pack(side="left")
         cb.bind("<<ComboboxSelected>>", lambda e: self.refresh())
+
         ttk.Button(top, text="Add project", command=self.add_project).pack(side="right")
-        ttk.Button(top, text="Scan folder...", command=self.scan_folder).pack(side="right", padx=6)
-        ttk.Button(top, text="Rescan", command=self.rescan).pack(side="right")
+        btn_scan = ttk.Button(top, text="Scan folder...", command=self.scan_folder)
+        btn_scan.pack(side="right", padx=6)
+        btn_rescan = ttk.Button(top, text="Rescan", command=self.rescan)
+        btn_rescan.pack(side="right")
+        self.scan_btns = [btn_scan, btn_rescan]
         ttk.Button(top, text="Get from GitHub...",
                    command=lambda: GitHubDialog(self)).pack(side="right", padx=(0, 6))
 
@@ -657,6 +847,7 @@ class Launcher(tk.Tk):
         ttk.Label(bar, textvariable=self.status, style="Status.TLabel",
                   padding=(14, 4)).pack(side="left", fill="x", expand=True)
         ttk.Button(bar, text="Pin to desktop", command=self.pin_to_desktop).pack(side="right", padx=14, pady=4)
+        ttk.Button(bar, text="Remove missing", command=self.remove_missing).pack(side="right", pady=4)
 
         pane = ttk.PanedWindow(self, orient="horizontal")
         pane.pack(fill="both", expand=True, padx=14, pady=(0, 6))
@@ -739,6 +930,7 @@ class Launcher(tk.Tk):
         for n, g in enumerate(sorted(counts, key=str.lower)):
             headers[g] = self.tree.insert("", "end", iid=f"g{n}", open=True,
                                           text=f"{g}  ({counts[g]})", values=("", ""))
+
         for i, p in enumerate(items):
             iid = f"p{i}"
             name = p["name"] + ("" if Path(p["path"]).is_dir() else "  (missing)")
@@ -753,7 +945,6 @@ class Launcher(tk.Tk):
         else:
             self.selected = None
             self.show_details(None)
-
         n, total = len(items), len(self.projects)
         self.status.set(f"{n} of {total} projects" if q else f"{total} projects")
 
@@ -786,6 +977,7 @@ class Launcher(tk.Tk):
         self.btn_play.config(state=state)
         for b in self.action_btns:
             b.config(state=state)
+
         if not p:
             if group:
                 self.lbl_name.config(text=group)
@@ -826,6 +1018,9 @@ class Launcher(tk.Tk):
 
     # -- actions -------------------------------------------------------------
     def save(self):
+        if not self.can_save:
+            self.status.set(f"Not saved: {CONFIG_FILE.name} couldn't be read at startup")
+            return
         try:
             save_config(self.cfg)
         except OSError as e:
@@ -916,7 +1111,7 @@ class Launcher(tk.Tk):
         p = self.selected
         if not p:
             return
-        if not (Path(p["path"]) / ".git").exists():
+        if not is_repo(Path(p["path"])):
             messagebox.showinfo("Not a git repo", f"{p['path']} has no .git folder.")
             return
         self.status.set(f"Pulling {p['name']}...")
@@ -925,11 +1120,12 @@ class Launcher(tk.Tk):
             try:
                 kw = {"creationflags": subprocess.CREATE_NO_WINDOW} if IS_WIN else {}
                 r = subprocess.run(["git", "pull"], cwd=p["path"], capture_output=True,
-                                   text=True, timeout=180, **kw)
+                                   text=True, timeout=180,
+                                   env=dict(os.environ, GIT_TERMINAL_PROMPT="0"), **kw)
                 out = (r.stdout + r.stderr).strip() or "Done."
             except Exception as e:  # git missing, timeout, etc.
                 out = f"git pull failed: {e}"
-            self.after(0, lambda: self._pull_done(p, out))
+            self.call_soon(self._pull_done, p, out)
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -969,6 +1165,30 @@ class Launcher(tk.Tk):
             self.save()
             self.refresh()
 
+    def remove_missing(self, intro=""):
+        """Offer to drop entries whose folders are gone. Returns True if it asked."""
+        missing = [p for p in self.projects if not Path(p["path"]).is_dir()]
+        if not missing:
+            if not intro:
+                messagebox.showinfo("Nothing missing", "Every project's folder is still there.")
+            return False
+        n = len(missing)
+        names = "\n".join("   " + p["name"] for p in missing[:12])
+        if n > 12:
+            names += f"\n   ...and {n - 12} more"
+        question = (f"{n} entr{'y points' if n == 1 else 'ies point'} to a folder that no longer exists:"
+                    f"\n\n{names}\n\nRemove {'it' if n == 1 else 'them'} from the library? "
+                    "Nothing on disk is touched, but notes and play counts for these entries are lost.")
+        if messagebox.askyesno("Missing folders", (intro + "\n\n" if intro else "") + question):
+            for p in missing:
+                self.projects.remove(p)
+            if any(p is self.selected for p in missing):
+                self.selected = None
+            self.save()
+            self.refresh()
+            self.status.set(f"Removed {n} missing entr{'y' if n == 1 else 'ies'}")
+        return True
+
     def pin_to_desktop(self):
         if not IS_WIN:
             messagebox.showinfo("Windows only", "Desktop shortcuts are only set up automatically on Windows.")
@@ -1006,19 +1226,23 @@ class Launcher(tk.Tk):
                 pass
         return ""
 
-    def add_folder(self, folder: Path) -> bool:
-        """Add one folder to the library (unless it's there already). True if added."""
-        key = os.path.normcase(os.path.normpath(str(folder)))
-        if any(os.path.normcase(os.path.normpath(p["path"])) == key for p in self.projects):
+    def add_folder(self, folder: Path, commit: bool = True) -> bool:
+        """Add one folder to the library (unless it's there already). True if added.
+        Pass commit=False when adding a batch, then save() and refresh() once."""
+        key = norm_key(folder)
+        if any(norm_key(p["path"]) == key for p in self.projects):
             return False
         proj = new_project(folder.name, folder, detect_command(folder), group=self.group_for(folder))
         self.projects.append(proj)
         self.selected = proj
-        self.save()
-        self.refresh()
+        if commit:
+            self.save()
+            self.refresh()
         return True
 
     def scan_folder(self, root=None):
+        if self.scanning:
+            return
         if not root:
             root = filedialog.askdirectory(title="Folder that holds all your projects")
             if not root:
@@ -1028,63 +1252,82 @@ class Launcher(tk.Tk):
             messagebox.showerror("Folder not found", str(root))
             return
         self.cfg["projects_dir"] = str(root)
-        known = {os.path.normcase(os.path.normpath(p["path"])): p for p in self.projects}
-        stats = {"added": 0, "no_cmd": 0, "replaced": 0}
-        self._scan(root, "", 0, known, stats)
+        self.save()
+
+        # snapshot what the worker needs, so it never touches self.projects
+        known = {}
+        for p in self.projects:
+            if p["command"]:
+                state = "project"
+            elif has_user_data(p):
+                state = "kept"
+            else:
+                state = "placeholder"
+            known[norm_key(p["path"])] = state
+
+        self.scanning = True
+        for b in self.scan_btns:
+            b.config(state="disabled")
+        self.status.set(f"Scanning {root}...")
+
+        def work():
+            try:
+                self.call_soon(self._scan_done, root, plan_scan(root, known), None)
+            except Exception as e:
+                self.call_soon(self._scan_done, root, [], e)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _scan_done(self, root, steps, error):
+        self.scanning = False
+        for b in self.scan_btns:
+            b.config(state="normal")
+        if error:
+            self.status.set("Scan failed")
+            messagebox.showerror("Scan failed", f"Couldn't scan {root}:\n{error}")
+            return
+
+        by_key = {norm_key(p["path"]): p for p in self.projects}
+        added = no_cmd = replaced = kept = 0
+        for step, key, folder, cmd, group in steps:
+            p = by_key.get(key)  # re-checked: the library may have changed during the scan
+            if step == "new":
+                if p is None:
+                    p = new_project(folder.name, folder, cmd, group=group)
+                    self.projects.append(p)
+                    by_key[key] = p
+                    added += 1
+                    no_cmd += not cmd
+            elif step == "existing":
+                if p is not None and group and not p.get("group"):
+                    p["group"] = group
+            elif step == "replace":
+                if p is not None and not p["command"] and not has_user_data(p):
+                    self.projects.remove(p)
+                    del by_key[key]
+                    if p is self.selected:
+                        self.selected = None
+                    replaced += 1
+            elif step == "kept":
+                kept += 1
         self.save()
         self.refresh()
-        added = stats["added"]
+
         msg = f"Added {added} new project{'s' if added != 1 else ''} from {root}."
-        if stats["replaced"]:
-            msg += (f"\n\n{stats['replaced']} old entr{'y' if stats['replaced'] == 1 else 'ies'} "
+        if replaced:
+            msg += (f"\n\n{replaced} old entr{'y' if replaced == 1 else 'ies'} "
                     "turned out to be a folder of projects and got replaced by what's inside.")
-        if stats["no_cmd"]:
-            msg += (f"\n\n{stats['no_cmd']} had no obvious way to run them. "
+        if kept:
+            msg += (f"\n\n{kept} entr{'y looks' if kept == 1 else 'ies look'} like a folder of projects "
+                    "but you've added notes, tags, or plays, so "
+                    f"{'it was' if kept == 1 else 'they were'} left alone. Remove one and Rescan "
+                    "to split it into its projects.")
+        if no_cmd:
+            msg += (f"\n\n{no_cmd} had no obvious way to run them. "
                     "Select each one and click Edit to set a command.")
         self.status.set(msg.splitlines()[0])
-        messagebox.showinfo("Scan finished", msg)
-
-    @staticmethod
-    def _subdirs(folder):
-        try:
-            return sorted((s for s in folder.iterdir() if s.is_dir()
-                           and not s.name.startswith(".") and s.name not in SKIP_DIRS),
-                          key=lambda s: s.name.lower())
-        except OSError:
-            return []
-
-    def _scan(self, folder, group, depth, known, stats):
-        """Walk `folder`. Runnable folders become projects; folders that just hold
-        other projects become a group and get walked in turn."""
-        for d in self._subdirs(folder):
-            key = os.path.normcase(os.path.normpath(str(d)))
-            cmd = detect_command(d)
-            kids = self._subdirs(d)
-            # A folder is a *group* (not a project) if nothing runs at its top level
-            # and it is either a direct child of the scan root or holds something
-            # that looks like a project (runnable, or its own git repo).
-            is_group = (not cmd and kids and depth < MAX_DEPTH and
-                        (depth == 0 or any(detect_command(k) or (k / ".git").is_dir() for k in kids)))
-
-            existing = known.get(key)
-            if existing is not None:
-                if is_group and not existing["command"]:
-                    # was added as a '?' placeholder by an older scan; its contents are the real projects
-                    self.projects.remove(existing)
-                    del known[key]
-                    stats["replaced"] += 1
-                else:
-                    if group and not existing.get("group"):
-                        existing["group"] = group
-                    continue
-
-            if is_group:
-                self._scan(d, f"{group}/{d.name}" if group else d.name, depth + 1, known, stats)
-                continue
-
-            self.projects.append(new_project(d.name, d, cmd, group=group))
-            stats["added"] += 1
-            stats["no_cmd"] += not cmd
+        if not self.remove_missing(intro=msg):
+            messagebox.showinfo("Scan finished", msg)
 
 
 if __name__ == "__main__":

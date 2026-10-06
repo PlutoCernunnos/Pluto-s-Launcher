@@ -1,6 +1,6 @@
 # Your personal library: local paths, play counts, and possibly a GitHub token.
 # Never commit this.
-launcher_config.json
+launcher_config*
 
 # Generated when you click "Pin to desktop"
 launcher.ico
